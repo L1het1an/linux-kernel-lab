@@ -1,0 +1,179 @@
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index 18b5500ea..c92e089d3 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -371,6 +371,9 @@
+ 447	common	memfd_secret		sys_memfd_secret
+ 448	common	process_mrelease	sys_process_mrelease
+ 
++# 449: lab experiment - my_getinfo
++449	common	my_getinfo		sys_my_getinfo
++
+ #
+ # Due to a historical design error, certain syscalls are numbered differently
+ # in x32 as compared to native x86_64.  These syscalls have numbers 512-547.
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index b8037a46f..8af5d2c10 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -70,6 +70,7 @@ struct clone_args;
+ struct open_how;
+ struct mount_attr;
+ struct landlock_ruleset_attr;
++struct myinfo;
+ enum landlock_rule_type;
+ 
+ #include <linux/types.h>
+@@ -917,6 +918,7 @@ asmlinkage long sys_madvise(unsigned long start, size_t len, int behavior);
+ asmlinkage long sys_process_madvise(int pidfd, const struct iovec __user *vec,
+ 			size_t vlen, int behavior, unsigned int flags);
+ asmlinkage long sys_process_mrelease(int pidfd, unsigned int flags);
++asmlinkage long sys_my_getinfo(pid_t pid, struct myinfo __user *uinfo);
+ asmlinkage long sys_remap_file_pages(unsigned long start, unsigned long size,
+ 			unsigned long prot, unsigned long pgoff,
+ 			unsigned long flags);
+diff --git a/include/uapi/linux/myinfo.h b/include/uapi/linux/myinfo.h
+new file mode 100644
+index 000000000..338e14143
+--- /dev/null
++++ b/include/uapi/linux/myinfo.h
+@@ -0,0 +1,35 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++/*
++ * include/uapi/linux/myinfo.h
++ *
++ * 实验：新增系统调用 my_getinfo 的用户态 / 内核态共用结构体。
++ * 放在 uapi 目录下，执行 make headers_install（或安装 linux-libc-dev 包）后，
++ * 用户态程序可以直接 #include <linux/myinfo.h>。
++ *
++ * 注意：结构体一旦发布就不能改变字段含义，只能往后追加字段并用 size 协商，
++ *      这是内核 ABI 的基本纪律（报告里可以作为设计要点的加分项）。
++ */
++#ifndef _UAPI_LINUX_MYINFO_H
++#define _UAPI_LINUX_MYINFO_H
++
++#include <linux/types.h>
++
++#define MYINFO_MAX_COMM 16	/* 与内核 TASK_COMM_LEN 一致 */
++
++struct myinfo {
++	__u32 size;			/* 调用者填 sizeof(struct myinfo) */
++	__s32 pid;			/* 线程 ID（内核 task_pid_nr） */
++	__s32 tgid;			/* 进程 ID（内核 task_tgid_nr） */
++	__u32 state;			/* task_struct::__state 原始值 */
++	__s32 prio;			/* 动态优先级，越小越优先 */
++	__s32 static_prio;		/* 静态优先级 */
++	__s32 policy;			/* 调度策略：SCHED_NORMAL / SCHED_FIFO ... */
++	__s32 on_cpu;			/* 是否正在 CPU 上运行 */
++	__u64 utime;			/* 用户态累计 CPU 时间，单位 ns */
++	__u64 stime;			/* 内核态累计 CPU 时间，单位 ns */
++	__u64 nvcsw;			/* 主动上下文切换次数 */
++	__u64 nivcsw;			/* 被动上下文切换次数 */
++	char  comm[MYINFO_MAX_COMM];	/* 进程名 */
++};
++
++#endif /* _UAPI_LINUX_MYINFO_H */
+diff --git a/kernel/Makefile b/kernel/Makefile
+index 599cb9264..a0c518e49 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -11,6 +11,7 @@ obj-y     = fork.o exec_domain.o panic.o \
+ 	    kthread.o sys_ni.o nsproxy.o \
+ 	    notifier.o ksysfs.o cred.o reboot.o \
+ 	    async.o range.o smpboot.o ucount.o regset.o
++obj-y     += mycall.o
+ 
+ obj-$(CONFIG_USERMODE_DRIVER) += usermode_driver.o
+ obj-$(CONFIG_MODULES) += kmod.o
+diff --git a/kernel/mycall.c b/kernel/mycall.c
+new file mode 100644
+index 000000000..f64a07167
+--- /dev/null
++++ b/kernel/mycall.c
+@@ -0,0 +1,86 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * kernel/mycall.c
++ *
++ * 实验：新增系统调用 my_getinfo（x86_64 编号见 syscall_64.tbl）
++ *
++ * 功能：读取指定进程（或线程）在内核里的关键状态，回填到用户态结构体
++ *       struct myinfo，供用户态程序观察进程管理模块的内部数据。
++ *
++ * 设计要点（报告里逐条对应）：
++ *   1) 用户态指针必须用 copy_to_user()/get_user() 访问，不能直接解引用；
++ *   2) 出错返回「负 errno」（-EINVAL/-ESRCH/-EFAULT），由 glibc 转成 errno；
++ *   3) task_struct 通过 get_pid_task() 拿到引用后必须 put_task_struct()；
++ *   4) 结构体带 size 字段做版本协商，便于以后向后兼容地扩展；
++ *   5) 真正的逻辑放在 kernel 内部函数 do_my_getinfo() 里，系统调用只做入口
++ *      （内核代码不应该相互调用 sys_xxx()）。
++ */
++
++#include <linux/kernel.h>
++#include <linux/sched.h>
++#include <linux/syscalls.h>
++#include <linux/pid.h>
++#include <linux/string.h>
++#include <linux/uaccess.h>
++#include <uapi/linux/myinfo.h>
++
++/* 把 task_struct 里关心的字段汇总到 myinfo（调用者需已持有 task 引用） */
++static void myinfo_fill(struct myinfo *info, struct task_struct *t)
++{
++	memset(info, 0, sizeof(*info));
++	info->size	= sizeof(*info);
++	info->pid	= task_pid_nr(t);
++	info->tgid	= task_tgid_nr(t);
++	info->state	= READ_ONCE(t->__state);
++	info->prio	= t->prio;
++	info->static_prio = t->static_prio;
++	info->policy	= t->policy;
++	info->on_cpu	= t->on_cpu;
++	info->utime	= t->utime;
++	info->stime	= t->stime;
++	info->nvcsw	= t->nvcsw;
++	info->nivcsw	= t->nivcsw;
++	get_task_comm(info->comm, t);
++}
++
++static long do_my_getinfo(pid_t pid, struct myinfo __user *uinfo)
++{
++	struct myinfo info;
++	struct task_struct *t;
++	struct pid *p;
++	u32 size;
++
++	if (!uinfo)
++		return -EINVAL;
++	if (pid <= 0)
++		return -EINVAL;
++
++	/* 版本协商：只接受与内核结构体完全一致的 size */
++	if (get_user(size, &uinfo->size))
++		return -EFAULT;
++	if (size != sizeof(struct myinfo))
++		return -EINVAL;
++
++	p = find_get_pid(pid);
++	if (!p)
++		return -ESRCH;
++	t = get_pid_task(p, PIDTYPE_PID);
++	put_pid(p);
++	if (!t)
++		return -ESRCH;
++
++	myinfo_fill(&info, t);
++	put_task_struct(t);
++
++	if (copy_to_user(uinfo, &info, sizeof(info)))
++		return -EFAULT;
++
++	pr_info("my_getinfo: pid=%d tgid=%d state=0x%x prio=%d comm=%s\n",
++		info.pid, info.tgid, info.state, info.prio, info.comm);
++	return 0;
++}
++
++SYSCALL_DEFINE2(my_getinfo, pid_t, pid, struct myinfo __user *, uinfo)
++{
++	return do_my_getinfo(pid, uinfo);
++}

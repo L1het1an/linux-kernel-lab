@@ -1,0 +1,72 @@
+diff --git a/fs/proc/base.c b/fs/proc/base.c
+index 23b2d6dd0..548fead59 100644
+--- a/fs/proc/base.c
++++ b/fs/proc/base.c
+@@ -504,6 +504,13 @@ static int proc_pid_stack(struct seq_file *m, struct pid_namespace *ns,
+ }
+ #endif
+ 
++static int proc_pid_sched_pick(struct seq_file *m, struct pid_namespace *ns,
++                               struct pid *pid, struct task_struct *task)
++{
++    seq_printf(m, "%lu\n", task->sched_pick_count);
++    return 0;
++}
++
+ #ifdef CONFIG_SCHED_INFO
+ /*
+  * Provides /proc/PID/schedstat
+@@ -3321,6 +3328,7 @@ static const struct pid_entry tgid_base_stuff[] = {
+ #endif
+ #ifdef CONFIG_SCHED_INFO
+ 	ONE("schedstat",  S_IRUGO, proc_pid_schedstat),
++	ONE("sched_pick", S_IRUGO, proc_pid_sched_pick),	/* lab: /proc/<pid>/sched_pick */
+ #endif
+ #ifdef CONFIG_LATENCYTOP
+ 	REG("latency",  S_IRUGO, proc_lstats_operations),
+@@ -3667,6 +3675,7 @@ static const struct pid_entry tid_base_stuff[] = {
+ #ifdef CONFIG_SCHED_INFO
+ 	ONE("schedstat", S_IRUGO, proc_pid_schedstat),
+ #endif
++	ONE("sched_pick", S_IRUGO, proc_pid_sched_pick),	//实验添加行
+ #ifdef CONFIG_LATENCYTOP
+ 	REG("latency",  S_IRUGO, proc_lstats_operations),
+ #endif
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 48e2e76c7..8ca7ea58c 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -844,6 +844,9 @@ struct task_struct {
+ 
+ 	struct sched_info		sched_info;
+ 
++	/* 进程被 CFS 调度器选中的次数（实验统计字段） */
++	unsigned long			sched_pick_count;
++
+ 	struct list_head		tasks;
+ #ifdef CONFIG_SMP
+ 	struct plist_node		pushable_tasks;
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 199799aaf..1842007de 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -969,6 +969,7 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
+ 	tsk->task_frag.page = NULL;
+ 	tsk->wake_q.next = NULL;
+ 	tsk->pf_io_worker = NULL;
++	tsk->sched_pick_count = 0;
+ 
+ 	account_kernel_stack(tsk, 1);
+ 
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 3a35bd128..c650c66b6 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -7607,6 +7607,7 @@ pick_next_task_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf
+ 	p = task_of(se);
+ 
+ done: __maybe_unused;
++	p->sched_pick_count++;
+ #ifdef CONFIG_SMP
+ 	/*
+ 	 * Move the next running task to the front of

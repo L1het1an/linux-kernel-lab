@@ -1,0 +1,20 @@
+--- a/include/uapi/linux/myinfo.h
++++ b/include/uapi/linux/myinfo.h
+@@ -30,6 +30,7 @@
+ 	__u64 nvcsw;			/* 主动上下文切换次数 */
+ 	__u64 nivcsw;			/* 被动上下文切换次数 */
+ 	char  comm[MYINFO_MAX_COMM];	/* 进程名 */
++	__u64 sched_pick_count;		/* 组员A：进程被 CFS 选中的次数 */
+ };
+ 
+ #endif /* _UAPI_LINUX_MYINFO_H */
+--- a/kernel/mycall.c
++++ b/kernel/mycall.c
+@@ -41,6 +41,7 @@
+ 	info->nvcsw	= t->nvcsw;
+ 	info->nivcsw	= t->nivcsw;
+ 	get_task_comm(info->comm, t);
++	info->sched_pick_count = t->sched_pick_count;
+ }
+ 
+ static long do_my_getinfo(pid_t pid, struct myinfo __user *uinfo)
